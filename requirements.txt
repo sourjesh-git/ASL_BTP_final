@@ -1,4 +1,6 @@
-mediapipe==0.8.9.1
-numpy==1.22.2
-opencv_python==4.5.5.62
-tensorflow==2.6.0
+mediapipe==0.10.20
+numpy==1.26.4
+opencv-python==4.9.0.80
+tensorflow==2.16.2
+google-genai
+python-dotenv
