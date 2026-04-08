@@ -12,7 +12,7 @@ load_dotenv()
 # In-memory cache: prefix (lowercase) -> list of completion strings
 _cache = {}
 
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-2.5-flash-lite"
 NUM_COMPLETIONS = 5
 
 

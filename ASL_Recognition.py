@@ -5,9 +5,12 @@ import numpy as np
 import cv2
 import time
 import threading
+import re
+from collections import Counter, deque
 from itertools import groupby
 import hand_detection as hd
 import gemini_predictions as gp
+import camb_tts
 
 # ---- 1. Build the original CNN architecture ----
 model = Sequential()
@@ -46,6 +49,26 @@ cap = cv2.VideoCapture(0)
 detector = hd.handDetector()
 samples_to_predict = []
 
+CONFIDENCE_THRESHOLD = 0.4
+SMOOTHING_WINDOW = 7
+smoothing_buffer = deque(maxlen=SMOOTHING_WINDOW)
+
+
+def majority_label_with_recency_tiebreak(buf):
+    """Majority vote over buffer; on ties prefer the most recent occurrence."""
+    buf_list = list(buf)
+    if not buf_list:
+        return "nothing"
+    counts = Counter(buf_list)
+    max_count = max(counts.values())
+    candidates = [lab for lab, n in counts.items() if n == max_count]
+    if len(candidates) == 1:
+        return candidates[0]
+    for i in range(len(buf_list) - 1, -1, -1):
+        if buf_list[i] in candidates:
+            return buf_list[i]
+    return candidates[0]
+
 # ---- Word buffer and Gemini prediction state ----
 current_word = ""
 last_committed_char = None
@@ -56,6 +79,11 @@ current_predictions = []
 predictions_lock = threading.Lock()
 DEBOUNCE_MS = 0.3
 CONSECUTIVE_FOR_COMMIT = 10
+
+TTS_IDLE_SEC = 3.0
+tts_busy = False
+pending_tts_flush = False
+last_tts_spoken_key = None
 
 
 def listToString(s):
@@ -93,6 +121,34 @@ def fetch_predictions_async(prefix: str):
     threading.Thread(target=task, daemon=True).start()
 
 
+def flush_word_and_gemini_state():
+    """Clear word buffer and related state after TTS (fresh start)."""
+    global current_word, last_committed_char, last_committed_count
+    global last_requested_prefix, last_commit_time, last_tts_spoken_key
+    current_word = ""
+    last_committed_char = None
+    last_committed_count = 0
+    last_requested_prefix = None
+    last_tts_spoken_key = None
+    samples_to_predict.clear()
+    smoothing_buffer.clear()
+    last_commit_time = time.time()
+    with predictions_lock:
+        current_predictions.clear()
+
+
+def tts_worker(text_to_speak: str):
+    global tts_busy, pending_tts_flush
+    try:
+        wav = camb_tts.get_or_synthesize_wav(text_to_speak)
+        camb_tts.play_wav_bytes(wav)
+    except Exception as e:
+        print("TTS error:", e)
+    finally:
+        tts_busy = False
+        pending_tts_flush = True
+
+
 # ---- 5. Main loop ----
 while True:
     success, img = cap.read()
@@ -109,39 +165,72 @@ while True:
     cv2.rectangle(img, (startX, startY), (endX, endY), 255, 4)
 
     cropped_video = img[50:300, 50:300]
-    if len(landmark_list) != 0:
-        if (startX <= landmark_list[0][1] <= endX) and (startY <= landmark_list[0][2] <= endY):
-            image = cv2.resize(cropped_video, (64, 64))
-            image = image.astype('float32') / 255.0
-            x = img_to_array(image)
-            x = np.expand_dims(image, axis=0)
+    hand_in_roi = (
+        len(landmark_list) != 0
+        and (startX <= landmark_list[0][1] <= endX)
+        and (startY <= landmark_list[0][2] <= endY)
+    )
+    if hand_in_roi:
+        image = cv2.resize(cropped_video, (64, 64))
+        image = image.astype('float32') / 255.0
+        x = img_to_array(image)
+        x = np.expand_dims(image, axis=0)
 
-            prediction = model.predict(x)
-            label = class_names[np.argmax(prediction)]
+        prediction = model.predict(x, verbose=0)
+        probs = prediction[0]
+        confidence = float(np.max(probs))
+        raw_label = class_names[int(np.argmax(probs))]
+        frame_vote = raw_label if confidence >= CONFIDENCE_THRESHOLD else "nothing"
+        smoothing_buffer.append(frame_vote)
+        label = majority_label_with_recency_tiebreak(smoothing_buffer)
 
-            samples_to_predict.append(label)
+        samples_to_predict.append(label)
 
-            # ---- Confirmed letter: last run of CONSECUTIVE_FOR_COMMIT+ same label ----
-            runs = [(k, len(list(g))) for k, g in groupby(samples_to_predict)]
-            if runs:
-                last_label, last_count = runs[-1]
-                if last_count >= CONSECUTIVE_FOR_COMMIT:
-                    if last_label != last_committed_char:
-                        commit_label(last_label)
-                        last_committed_char = last_label
-                        if len(current_word) >= 2:
-                            fetch_predictions_async(current_word)
-                    last_committed_count = last_count
+        # ---- Confirmed letter: last run of CONSECUTIVE_FOR_COMMIT+ same label ----
+        runs = [(k, len(list(g))) for k, g in groupby(samples_to_predict)]
+        if runs:
+            last_label, last_count = runs[-1]
+            if last_count >= CONSECUTIVE_FOR_COMMIT:
+                if last_label != last_committed_char:
+                    commit_label(last_label)
+                    last_committed_char = last_label
+                    if len(current_word) >= 2:
+                        fetch_predictions_async(current_word)
+                last_committed_count = last_count
 
-            string_labels = listToString(samples_to_predict)
-            if len(string_labels) >= 10:
-                import re
-                consecutive = [match[1] for match in re.findall(r'((\w)\2{9,})', string_labels)]
-                cv2.putText(img, format(consecutive), (90, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        string_labels = listToString(samples_to_predict)
+        if len(string_labels) >= 10:
+            consecutive = [match[1] for match in re.findall(r'((\w)\2{9,})', string_labels)]
+            cv2.putText(img, format(consecutive), (90, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-            cv2.putText(img, label, (90, 90), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7, (0, 255, 0), 2)
+        cv2.putText(img, f"{label} ({confidence:.2f})", (90, 90), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, (0, 255, 0), 2)
+    else:
+        smoothing_buffer.clear()
+
+    if pending_tts_flush:
+        flush_word_and_gemini_state()
+        pending_tts_flush = False
+
+    # ---- Camb TTS: last segment, >=3 letters, 3s idle, one word per run then flush ----
+    segment = camb_tts.get_last_segment(current_word)
+    if (
+        not tts_busy
+        and not pending_tts_flush
+        and camb_tts.letter_count(segment) >= 3
+        and (time.time() - last_commit_time) >= TTS_IDLE_SEC
+    ):
+        text_to_speak = segment.strip()
+        key = text_to_speak.lower()
+        if key != last_tts_spoken_key:
+            last_tts_spoken_key = key
+            tts_busy = True
+            threading.Thread(
+                target=tts_worker,
+                args=(text_to_speak,),
+                daemon=True,
+            ).start()
 
     # ---- 300ms debounce: after pause, fetch predictions if prefix >= 2 ----
     if len(current_word) >= 2 and (time.time() - last_commit_time) >= DEBOUNCE_MS:
@@ -156,6 +245,8 @@ while True:
     for i, p in enumerate(preds[:3]):
         cv2.putText(img, f"{i + 1}. {p}", (50, 350 + 25 * i),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 0), 2)
+    if tts_busy:
+        cv2.putText(img, "TTS...", (50, 430), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 255), 1)
 
     cv2.imshow("Image", img)
     if cv2.waitKey(1) & 0xFF == ord('q'):
