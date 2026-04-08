@@ -4,3 +4,5 @@ opencv-python==4.9.0.80
 tensorflow==2.16.2
 google-genai
 python-dotenv
+camb-sdk
+pygame
